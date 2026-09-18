@@ -259,7 +259,7 @@ func patchOutputItem(p *patcher, prefix string, item gjson.Result, index int, do
 		status = "completed"
 	}
 	switch item.Get("type").String() {
-	case "function_call":
+	case "function_call", "custom_tool_call":
 		if item.Get("id").String() == "" {
 			p.set(prefix+".id", firstNonEmpty(item.Get("call_id").String(), "fc_"+strconv.Itoa(index)))
 		}

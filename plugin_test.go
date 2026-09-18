@@ -129,6 +129,176 @@ func TestFlattenNamespaceTools(t *testing.T) {
 	}
 }
 
+func TestFlattenNamespaceToolsFromCodexAdditionalTools(t *testing.T) {
+	body := []byte(`{
+		"model":"devin/swe-2",
+		"input":[
+			{"role":"user","content":"fix it"},
+			{"type":"additional_tools","tools":[
+				{"type":"function","name":"shell","parameters":{"type":"object"}},
+				{"type":"namespace","name":"functions","tools":[
+					{"type":"custom","name":"apply_patch","description":"apply patch","format":{"type":"grammar","syntax":"lark","definition":"start: /.+/"}},
+					{"type":"function","name":"wait","parameters":{"type":"object"}},
+					{"type":"function","name":"shell","parameters":{"type":"object"}}
+				]}
+			]}
+		]
+	}`)
+
+	out, namespaces, tools := flattenNamespaceTools(body)
+	if namespaces != 1 || tools != 2 {
+		t.Fatalf("namespaces=%d tools=%d", namespaces, tools)
+	}
+
+	additional := gjson.GetBytes(out, "input.1.tools").Array()
+	if len(additional) != 3 {
+		t.Fatalf("additional tools len=%d: %s", len(additional), out)
+	}
+	if got := additional[0].Get("name").String(); got != "shell" {
+		t.Fatalf("first tool=%q", got)
+	}
+	if got, typ := additional[1].Get("name").String(), additional[1].Get("type").String(); got != "apply_patch" || typ != "custom" {
+		t.Fatalf("custom tool not preserved: %s", additional[1].Raw)
+	}
+	if got := additional[2].Get("name").String(); got != "wait" {
+		t.Fatalf("third tool=%q", got)
+	}
+	if gjson.GetBytes(out, "input.0.content").String() != "fix it" {
+		t.Fatalf("ordinary input item changed: %s", out)
+	}
+	if gjson.GetBytes(out, "input.1.tools.#(type==\"namespace\")").Exists() {
+		t.Fatalf("namespace tool remained: %s", out)
+	}
+}
+
+func TestFlattenNamespaceToolsDeduplicatesAcrossResponsesToolLocations(t *testing.T) {
+	body := []byte(`{
+		"tools":[{"type":"function","name":"shell","parameters":{"type":"object"}}],
+		"input":[{"type":"additional_tools","tools":[
+			{"type":"namespace","name":"functions","tools":[
+				{"type":"function","name":"shell","parameters":{"type":"object"}},
+				{"type":"function","name":"wait","parameters":{"type":"object"}}
+			]}
+		]}]
+	}`)
+
+	out, namespaces, tools := flattenNamespaceTools(body)
+	if namespaces != 1 || tools != 1 {
+		t.Fatalf("namespaces=%d tools=%d", namespaces, tools)
+	}
+	if got := gjson.GetBytes(out, "input.0.tools.0.name").String(); got != "wait" {
+		t.Fatalf("cross-location duplicate not removed, got=%q body=%s", got, out)
+	}
+}
+
+func TestRequestInterceptorFlattensCodexResponsesLiteTools(t *testing.T) {
+	resetConfig()
+	req := pluginapi.RequestInterceptRequest{
+		SourceFormat:   "openai-response",
+		RequestedModel: "devin/swe-2",
+		Body:           []byte(`{"model":"devin/swe-2","input":[{"type":"additional_tools","tools":[{"type":"namespace","name":"functions","tools":[{"type":"function","name":"exec","parameters":{"type":"object"}}]}]}]}`),
+	}
+	var resp pluginapi.RequestInterceptResponse
+	call(t, pluginabi.MethodRequestInterceptBefore, req, &resp)
+	if len(resp.Body) == 0 {
+		t.Fatal("Codex Responses Lite additional_tools request was not rewritten")
+	}
+	if got := gjson.GetBytes(resp.Body, "input.0.tools.0.name").String(); got != "exec" {
+		t.Fatalf("flattened tool=%q body=%s", got, resp.Body)
+	}
+}
+
+func TestSanitizeResponsesToolSchemasInlinesLocalRefs(t *testing.T) {
+	body := []byte(`{
+		"tools":[{
+			"type":"function",
+			"name":"automation_update",
+			"parameters":{
+				"$defs":{
+					"string":{"type":"string"},
+					"nullable":{"anyOf":[{"$ref":"#/$defs/string"},{"type":"null"}]},
+					"cron":{"type":"object","properties":{
+						"name":{"$ref":"#/$defs/string"},
+						"notificationPolicy":{"$ref":"#/$defs/nullable"}
+					}}
+				},
+				"oneOf":[{"$ref":"#/$defs/cron"}],
+				"properties":{},
+				"type":"object"
+			}
+		}],
+		"input":[{"type":"additional_tools","tools":[{
+			"type":"function",
+			"name":"secondary",
+			"parameters":{"definitions":{"value":{"type":"integer"}},"properties":{"count":{"$ref":"#/definitions/value"}},"type":"object"}
+		}]}]
+	}`)
+
+	out, schemas, refs := sanitizeResponsesToolSchemas(body)
+	if schemas != 2 || refs != 5 {
+		t.Fatalf("schemas=%d refs=%d body=%s", schemas, refs, out)
+	}
+	if gjson.GetBytes(out, `tools.0.parameters.$defs`).Exists() ||
+		gjson.GetBytes(out, `input.0.tools.0.parameters.definitions`).Exists() {
+		t.Fatalf("schema definitions were not removed: %s", out)
+	}
+	if strings.Contains(string(out), `"$ref"`) {
+		t.Fatalf("local refs remained: %s", out)
+	}
+	if got := gjson.GetBytes(out, "tools.0.parameters.oneOf.0.properties.name.type").String(); got != "string" {
+		t.Fatalf("inlined name type=%q body=%s", got, out)
+	}
+	if got := gjson.GetBytes(out, "tools.0.parameters.oneOf.0.properties.notificationPolicy.anyOf.0.type").String(); got != "string" {
+		t.Fatalf("nested inlined type=%q body=%s", got, out)
+	}
+	if got := gjson.GetBytes(out, "input.0.tools.0.parameters.properties.count.type").String(); got != "integer" {
+		t.Fatalf("definitions ref type=%q body=%s", got, out)
+	}
+}
+
+func TestSanitizeResponsesToolSchemasBreaksRecursiveLocalRefs(t *testing.T) {
+	body := []byte(`{"tools":[{"type":"function","name":"tree","parameters":{
+		"$defs":{"node":{"type":"object","properties":{"child":{"$ref":"#/$defs/node"}}}},
+		"type":"object","properties":{"root":{"$ref":"#/$defs/node"}}
+	}}]}`)
+
+	out, schemas, refs := sanitizeResponsesToolSchemas(body)
+	if schemas != 1 || refs != 2 {
+		t.Fatalf("schemas=%d refs=%d body=%s", schemas, refs, out)
+	}
+	if strings.Contains(string(out), `"$ref"`) || strings.Contains(string(out), `"$defs"`) {
+		t.Fatalf("recursive ref remained: %s", out)
+	}
+	if got := gjson.GetBytes(out, "tools.0.parameters.properties.root.type").String(); got != "object" {
+		t.Fatalf("root schema lost: %s", out)
+	}
+	if raw := gjson.GetBytes(out, "tools.0.parameters.properties.root.properties.child").Raw; raw != `{}` {
+		t.Fatalf("recursive edge must become permissive schema, got=%s body=%s", raw, out)
+	}
+}
+
+func TestRequestInterceptorSanitizesResponsesToolSchemas(t *testing.T) {
+	resetConfig()
+	req := pluginapi.RequestInterceptRequest{
+		SourceFormat:   "openai-response",
+		RequestedModel: "devin/swe-2",
+		Body: []byte(`{"model":"devin/swe-2","tools":[{"type":"function","name":"automation_update","parameters":{
+			"$defs":{"s":{"type":"string"}},"type":"object","properties":{"id":{"$ref":"#/$defs/s"}}
+		}}],"input":"hi"}`),
+	}
+	var resp pluginapi.RequestInterceptResponse
+	call(t, pluginabi.MethodRequestInterceptBefore, req, &resp)
+	if len(resp.Body) == 0 {
+		t.Fatal("Responses tool schema was not rewritten")
+	}
+	if got := gjson.GetBytes(resp.Body, "tools.0.parameters.properties.id.type").String(); got != "string" {
+		t.Fatalf("schema was not inlined, got=%q body=%s", got, resp.Body)
+	}
+	if strings.Contains(string(resp.Body), `"$ref"`) || strings.Contains(string(resp.Body), `"$defs"`) {
+		t.Fatalf("unsupported local schema references remained: %s", resp.Body)
+	}
+}
+
 func sse(event, data string) []byte {
 	return []byte("event: " + event + "\ndata: " + data)
 }
@@ -206,6 +376,28 @@ func TestPatchResponsesNonStream(t *testing.T) {
 		out.Get("output.1.id").String() != "read_0#b" || out.Get("output.1.status").String() != "completed" ||
 		out.Get("output.2.id").String() == "" || !out.Get("output.2.content.0.annotations").IsArray() {
 		t.Fatalf("non-stream not patched: %s", resp.Body)
+	}
+}
+
+func TestPatchResponsesCustomToolItems(t *testing.T) {
+	resetConfig()
+	added := chunk(t, "custom-1", sse("response.output_item.added", `{"type":"response.output_item.added","output_index":0,"item":{"type":"custom_tool_call","call_id":"call_patch","name":"apply_patch","input":""},"sequence_number":1}`))
+	if added.Get("item.id").String() != "call_patch" || added.Get("item.status").String() != "in_progress" {
+		t.Fatalf("custom added item not patched: %s", added.Raw)
+	}
+
+	done := chunk(t, "custom-1", sse("response.output_item.done", `{"type":"response.output_item.done","output_index":0,"item":{"type":"custom_tool_call","call_id":"call_patch","name":"apply_patch","input":"*** Begin Patch"},"sequence_number":2}`))
+	if done.Get("item.id").String() != "call_patch" || done.Get("item.status").String() != "completed" {
+		t.Fatalf("custom done item not patched: %s", done.Raw)
+	}
+
+	out, fixes := patchResponsesObject([]byte(`{"id":"response_custom","object":"response","status":"completed","output":[{"type":"custom_tool_call","call_id":"call_patch","name":"apply_patch","input":"patch"}]}`))
+	if fixes == 0 {
+		t.Fatal("non-stream custom tool item was not patched")
+	}
+	root := gjson.ParseBytes(out)
+	if root.Get("output.0.id").String() != "call_patch" || root.Get("output.0.status").String() != "completed" {
+		t.Fatalf("non-stream custom tool item not patched: %s", out)
 	}
 }
 

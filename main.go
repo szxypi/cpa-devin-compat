@@ -29,6 +29,9 @@ type config struct {
 	// FlattenNamespaceTools 把 Responses 请求里的 namespace 工具展开成普通 function 工具，
 	// 否则 devin 执行器会发出无名工具，上游返回 invalid_argument。
 	FlattenNamespaceTools bool `yaml:"flatten-namespace-tools"`
+	// SanitizeToolSchemas 内联 function parameters 中的本地 JSON Schema 引用，
+	// 避免 Devin 对复杂 $defs/$ref 图返回 invalid_argument。
+	SanitizeToolSchemas bool `yaml:"sanitize-tool-schemas"`
 	// FixResponses 补齐 Interactions→Responses 转换缺失的必填字段（AI SDK 会做严格校验）。
 	FixResponses bool `yaml:"fix-responses"`
 	// NormalizeChatToolIndex 把 chat 流里按步骤编号的 tool_calls.index 改成从 0 连续编号。
@@ -43,6 +46,7 @@ func defaultConfig() config {
 		SessionPin:             true,
 		SessionHeader:          "X-Session-Id",
 		FlattenNamespaceTools:  true,
+		SanitizeToolSchemas:    true,
 		FixResponses:           true,
 		NormalizeChatToolIndex: true,
 		Log:                    true,
@@ -165,7 +169,8 @@ func register(raw []byte) ([]byte, error) {
 			{Name: "models", Type: pluginapi.ConfigFieldTypeArray, Description: "生效的模型通配符列表（path.Match 语义，\"*\" 不跨越 \"/\"），默认 devin/*。"},
 			{Name: "session-pin", Type: pluginapi.ConfigFieldTypeBoolean, Description: "请求没有显式会话标识时，按系统提示词与首条用户消息补一个稳定会话头，让 Devin 的 prompt cache 跨轮命中。"},
 			{Name: "session-header", Type: pluginapi.ConfigFieldTypeString, Description: "补写的会话头名称，默认 X-Session-Id。"},
-			{Name: "flatten-namespace-tools", Type: pluginapi.ConfigFieldTypeBoolean, Description: "把 Responses 请求里的 namespace 工具展开成普通 function 工具，避免上游 invalid_argument。"},
+			{Name: "flatten-namespace-tools", Type: pluginapi.ConfigFieldTypeBoolean, Description: "把顶层 tools 与 Codex additional_tools 里的 namespace 工具展开，保留 function/custom 子工具，避免 Devin MCP configuration issue。"},
+			{Name: "sanitize-tool-schemas", Type: pluginapi.ConfigFieldTypeBoolean, Description: "内联 Responses function parameters 中的本地 $defs/$ref，避免 Devin 对复杂引用图返回 invalid_argument。"},
 			{Name: "fix-responses", Type: pluginapi.ConfigFieldTypeBoolean, Description: "补齐 Responses 流式与非流式输出缺失的必填字段（created_at、item_id、summary_index、status、输出条目 id）。"},
 			{Name: "normalize-chat-tool-index", Type: pluginapi.ConfigFieldTypeBoolean, Description: "把 chat/completions 流里的 tool_calls.index 规范为从 0 开始连续编号。"},
 			{Name: "log", Type: pluginapi.ConfigFieldTypeBoolean, Description: "是否把会话补写、工具展开、字段修补记录到日志。"},
@@ -188,6 +193,13 @@ func interceptRequest(c *config, req pluginapi.RequestInterceptRequest) pluginap
 			body = out
 			resp.Body = out
 			logf("namespace-flatten model=%s namespaces=%d tools=%d", firstNonEmpty(req.RequestedModel, req.Model), namespaces, tools)
+		}
+	}
+	if c.SanitizeToolSchemas && mayCarryResponses(req.SourceFormat) {
+		if out, schemas, refs := sanitizeResponsesToolSchemas(body); schemas > 0 {
+			body = out
+			resp.Body = out
+			logf("schema-inline model=%s schemas=%d refs=%d", firstNonEmpty(req.RequestedModel, req.Model), schemas, refs)
 		}
 	}
 	if c.SessionPin && req.Headers.Get(c.SessionHeader) == "" {
